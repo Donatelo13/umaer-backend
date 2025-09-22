@@ -1,271 +1,234 @@
 
 import os
-import uuid
 import re
-import json
+import uuid
 from pathlib import Path
 from typing import List, Tuple
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from PyPDF2 import PdfReader
 from werkzeug.utils import secure_filename
+from PyPDF2 import PdfReader
 
-# =============== Config básica ===============
-# En Render, usa /tmp (persistencia efímera, válida para la sesión del proceso)
-BASE_DIR = Path("/tmp")
-UPLOAD_ROOT = BASE_DIR / "uploads"
-SESSIONS_ROOT = BASE_DIR / "sessions"
+# --- Config ---
+UPLOAD_ROOT = Path("uploads")
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
-SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
 
-ALLOWED_EXTS = {".pdf"}  # si quieres permitir imágenes, añádelas, pero aquí solo PDF
-MAX_UPLOAD_MB = 25
+ALLOWED_EXTS = {".pdf", ".png", ".jpg", ".jpeg"}
+MAX_CONTENT_LENGTH = 25 * 1024 * 1024  # 25 MB
 
-# OpenAI opcional
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")  # cambia si prefieres otro
-USE_OPENAI = bool(OPENAI_API_KEY)
-
-# Flask
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
 CORS(app)
-app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024  # 25 MB
 
-# =============== Utilidades de ficheros ===============
+
+# ---------- Utilidades de ficheros / sesiones ----------
 def allowed_file(name_or_path) -> bool:
     return Path(name_or_path).suffix.lower() in ALLOWED_EXTS
 
 def ensure_session_dir(session_id: str) -> Path:
-    d = UPLOAD_ROOT / session_id
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-def session_state_path(session_id: str) -> Path:
-    return SESSIONS_ROOT / f"{session_id}.json"
-
-def load_session_state(session_id: str) -> dict:
-    p = session_state_path(session_id)
-    if p.exists():
-        try:
-            return json.loads(p.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-def save_session_state(session_id: str, data: dict):
-    p = session_state_path(session_id)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    ses = UPLOAD_ROOT / session_id
+    ses.mkdir(parents=True, exist_ok=True)
+    return ses
 
 def save_file(file_storage, dest_dir: Path) -> Path:
     safe_name = secure_filename(file_storage.filename or f"file_{uuid.uuid4().hex}")
     if not allowed_file(safe_name):
-        raise ValueError("Tipo de archivo no permitido (solo PDF).")
+        raise ValueError("Tipo de archivo no permitido (usa .pdf/.png/.jpg/.jpeg).")
     dest = dest_dir / safe_name
+    dest_dir.mkdir(parents=True, exist_ok=True)
     file_storage.save(dest)
     return dest
 
 def extract_text_from_pdf(pdf_path: Path) -> str:
     try:
         reader = PdfReader(str(pdf_path))
-        return "\n".join((page.extract_text() or "") for page in reader.pages)
+        buff = []
+        for page in reader.pages:
+            try:
+                buff.append(page.extract_text() or "")
+            except Exception:
+                buff.append("")
+        return "\n".join(buff)
     except Exception as e:
-        return f"[Error leyendo {pdf_path.name}: {e}]"
+        return f"[No se pudo extraer texto de {pdf_path.name}: {e}]"
 
-# =============== Indexado y búsqueda (RAG-lite) ===============
-_WORD = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+")
-
-def tokenize(s: str) -> List[str]:
-    return [w.lower() for w in _WORD.findall(s or "")]
-
-def chunk_text(text: str, size=900, overlap=150) -> List[str]:
-    text = (text or "").strip()
-    if not text:
-        return []
-    chunks = []
-    start = 0
-    n = len(text)
-    while start < n:
-        end = min(n, start + size)
-        chunk = text[start:end]
-        # intenta cortar en fin de frase si queda cerca
-        if end < n:
-            p = text.find(".", end, min(n, end + 200))
-            if p != -1:
-                chunk = text[start:p + 1]
-                end = p + 1
-        chunks.append(chunk.strip())
-        start = max(end - overlap, end)
-    return chunks
-
-def build_index_for_session(session_dir: Path) -> List[Tuple[str, str]]:
+def collect_session_texts(ses_dir: Path) -> List[Tuple[str, str]]:
     """
-    Devuelve lista de (filename, chunk_text) para todos los PDFs en la sesión.
+    Devuelve [(nombre_fichero, texto)] solo de PDFs.
+    (Si quisieras OCR para imágenes, aquí sería el sitio.)
     """
-    index = []
-    for p in sorted(session_dir.iterdir()):
+    out = []
+    for p in ses_dir.iterdir():
         if p.suffix.lower() == ".pdf":
-            full = extract_text_from_pdf(p)
-            for ch in chunk_text(full):
-                if ch:
-                    index.append((p.name, ch))
-    return index
+            out.append((p.name, extract_text_from_pdf(p)))
+    return out
 
-def score_chunk(query_terms: set, chunk: str) -> float:
-    terms = set(tokenize(chunk))
-    if not terms:
-        return 0.0
-    # métrica simple: intersección normalizada
-    return len(query_terms & terms) / max(1, len(query_terms))
 
-def search_best_chunks(session_dir: Path, query: str, k=4) -> List[Tuple[float, str, str]]:
-    idx = build_index_for_session(session_dir)
-    if not idx:
-        return []
-    q_terms = set(tokenize(query))
+# ---------- “NLP” ligero ----------
+STOPWORDS = set("""
+a al algo algunas algunos ante antes como con contra cual cuales cuando de del desde donde dos el
+ella ellas ellos en entre era eran es esa esas ese eso esos esta estaba estaban estamos estar este
+estos fue fueron ha hasta hay la las le les lo los mas me mi mis mucho muy nada ni no nos o os
+otra otros para pero poco por porque que quien quienes se ser si sobre sin su sus te tiene tuvo un
+una uno y ya yo tu usted ustedes él ella ello nosotros vosotros
+kg ml mg mcg min hora horas h l/min
+""".split())
+
+def tokenize(text: str) -> List[str]:
+    # minúsculas + palabras
+    return re.findall(r"[a-záéíóúüñ0-9]+", text.lower())
+
+def key_terms(text: str) -> List[str]:
+    return [t for t in tokenize(text) if t not in STOPWORDS and len(t) > 2]
+
+def split_sentences(text: str) -> List[str]:
+    # Segmentación simple por puntos/interrogaciones/exclamaciones y saltos de línea
+    parts = re.split(r"[\.!\?\n]+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+def score_sentence(sentence: str, q_terms: List[str]) -> int:
+    s_terms = set(key_terms(sentence))
+    return sum(1 for t in q_terms if t in s_terms)
+
+def extractive_answer(docs: List[Tuple[str, str]], question: str, top_k: int = 3):
+    q_terms = key_terms(question)
     if not q_terms:
-        return []
-    scored = []
-    for fname, ch in idx:
-        s = score_chunk(q_terms, ch)
-        if s > 0:
-            scored.append((s, fname, ch))
-    scored.sort(key=lambda t: t[0], reverse=True)
-    return scored[:k]
+        return None
 
-# =============== OpenAI (opcional) ===============
-def call_openai(messages: List[dict], max_tokens=600, temperature=0.3) -> str:
-    """
-    Llama al modelo de OpenAI si hay API key. Si no, devuelve cadena vacía.
-    """
-    if not USE_OPENAI:
-        return ""
-    try:
-        # SDK ligero vía HTTP para evitar versiones
-        import requests
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": OPENAI_MODEL,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"[Error del modelo: {e}]"
+    candidates = []  # (score, sentence, filename)
+    for fname, fulltext in docs:
+        for sent in split_sentences(fulltext):
+            sc = score_sentence(sent, q_terms)
+            if sc > 0:
+                candidates.append((sc, sent, fname))
 
-# =============== Helpers conversación ===============
-SYSTEM_PROMPT = (
-    "Eres el asistente médico de UMAER. Responde en español, claro y conciso. "
-    "Si proporciono fragmentos de documentos, ÚSALOS como base principal. "
-    "Cita el nombre del archivo entre paréntesis cuando corresponda. "
-    "Si no hay información relevante en los documentos, responde de forma general, "
-    "pero indica que no se halló información específica en los PDFs."
-)
+    if not candidates:
+        return None
 
-def build_messages(user_message: str, rag_snippets: List[Tuple[float, str, str]], history: List[dict]) -> List[dict]:
-    """
-    Construye el prompt para OpenAI con: system + contexto (si lo hay) + historial + mensaje del usuario.
-    """
-    msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
-    # Inyecta contexto si hay
-    if rag_snippets:
-        ctx_lines = ["Contexto de documentos (extractos relevantes):"]
-        for score, fname, ch in rag_snippets:
-            sn = ch if len(ch) <= 700 else ch[:700].rsplit(" ", 1)[0] + "…"
-            ctx_lines.append(f"- [{fname}] {sn}")
-        msgs.append({"role": "system", "content": "\n".join(ctx_lines)})
+    # ordenar por score (desc) y longitud (desc ligera para evitar frases muy cortas)
+    candidates.sort(key=lambda x: (x[0], len(x[1])), reverse=True)
+    top = candidates[:top_k]
 
-    # Historial breve (últimas 6 intervenciones)
-    for m in history[-6:]:
-        msgs.append(m)
+    hits = "\n".join([f"• {s}  ({fn})" for _, s, fn in top])
+    return hits
 
-    # Mensaje del usuario
-    msgs.append({"role": "user", "content": user_message})
-    return msgs
 
-# =============== Endpoints ===============
+# ---------- Respuestas de “chat ligero” ----------
+def smalltalk_reply(user_text: str) -> str:
+    t = user_text.strip().lower()
+
+    # saludos
+    if re.search(r"\b(hola|buenas|buenos días|buenas tardes|hey|qué tal)\b", t):
+        return "¡Hola! Soy tu asistente UMAER 😊. Puedo charlar y también buscar en los PDF que hayas cargado. ¿En qué te ayudo?"
+
+    # despedidas
+    if re.search(r"\b(ad[ií]os|hasta luego|nos vemos|gracias,? ad[ií]os)\b", t):
+        return "¡Hasta luego! Si necesitas algo, aquí estaré. 👋"
+
+    # quién eres
+    if re.search(r"qu[ié]n eres|qu[ée] puedes hacer|ayuda|help", t):
+        return (
+            "Soy un asistente ‘ligero’: puedo conversar de forma natural y, si adjuntas o ya tienes PDFs en el gestor, "
+            "puedo buscar información relevante en ellos para responder mejor. "
+            "Prueba con: “resume el protocolo X del PDF”, “¿qué dosis sugiere el documento Y?”, etc."
+        )
+
+    # gracias
+    if re.search(r"\b(gracias|muchas gracias|mil gracias)\b", t):
+        return "¡A ti! ¿Seguimos con algo más? 🙌"
+
+    # fallback general
+    return (
+        "Te escucho. Si tu pregunta depende de documentos, adjunta un PDF o usa el gestor de archivos, "
+        "y lo tendré en cuenta. Si es charla general, también puedo responder de forma natural 🙂."
+    )
+
+
+# ---------- Rutas ----------
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", use_openai=USE_OPENAI, model=OPENAI_MODEL if USE_OPENAI else None)
+    return jsonify(status="ok")
+
 
 @app.post("/api/chat")
 def chat():
     """
     Acepta:
-    - form-data: message, session_id, files (opcional)
-    - JSON: { "message": "...", "session_id": "..." }
+    - multipart/form-data: fields 'message', 'session_id', y opcional 'files'
+    - application/json:    {"message": "...", "session_id": "..."}
     """
-    # Entrada: JSON o form-data
-    if request.is_json:
-        data = request.get_json(silent=True) or {}
-        message = (data.get("message") or "").strip()
-        session_id = data.get("session_id") or uuid.uuid4().hex
-        incoming_files = []
-    else:
+    # 1) Leer message + session_id desde multipart o JSON
+    message = ""
+    session_id = request.form.get("session_id") or ""
+    if request.content_type and "multipart/form-data" in request.content_type.lower():
         message = (request.form.get("message") or "").strip()
-        session_id = request.form.get("session_id") or uuid.uuid4().hex
-        incoming_files = request.files.getlist("files") if "files" in request.files else []
-
-    if not message and not incoming_files:
-        return jsonify(error="Envía un mensaje o adjunta un PDF."), 400
-
-    # Directorio de sesión y guardado de adjuntos
-    ses_dir = ensure_session_dir(session_id)
-    saved_files = []
-    try:
-        for f in incoming_files:
-            if f and f.filename:
-                dest = save_file(f, ses_dir)
-                saved_files.append(dest.name)
-    except ValueError as ve:
-        return jsonify(error=str(ve)), 415
-
-    # Estado de sesión (historial de chat)
-    state = load_session_state(session_id)
-    history = state.get("history", [])  # lista de dicts: {"role": "user"/"assistant", "content": "..."}
-    # Registramos el mensaje del usuario en historial
-    if message:
-        history.append({"role": "user", "content": message})
-
-    # Búsqueda en PDFs
-    rag = search_best_chunks(ses_dir, message, k=4)
-
-    # Si hay OpenAI: conversa + usa contexto. Si no, responde extractivo.
-    if USE_OPENAI:
-        msgs = build_messages(message, rag, history)
-        answer = call_openai(msgs)
-        reply = answer.strip() if answer else "No pude generar respuesta."
-
-        # Guarda respuesta en historial
-        history.append({"role": "assistant", "content": reply})
-        state["history"] = history
-        save_session_state(session_id, state)
-        return jsonify(session_id=session_id, reply=reply, used_files=saved_files)
     else:
-        # Modo fallback (sin OpenAI): responde con citas de los documentos
-        if rag:
-            lines = [f"**Respuesta basada en tus documentos** (coincidencias: {len(rag)})"]
-            for i, (score, fname, chunk) in enumerate(rag, 1):
-                snippet = chunk if len(chunk) <= 500 else chunk[:500].rsplit(" ", 1)[0] + "…"
-                lines.append(f"{i}. ({fname}) {snippet}")
-            reply = "\n\n".join(lines)
-        else:
-            has_pdfs = any(p.suffix.lower() == ".pdf" for p in ses_dir.iterdir())
-            reply = ("No encontré coincidencias en tus PDFs." if has_pdfs
-                     else "No hay PDFs en tu sesión. Adjunta alguno para buscar contenido.")
-        history.append({"role": "assistant", "content": reply})
-        state["history"] = history
-        save_session_state(session_id, state)
-        return jsonify(session_id=session_id, reply=reply, used_files=saved_files)
+        try:
+            js = request.get_json(silent=True) or {}
+        except Exception:
+            js = {}
+        message = (js.get("message") or "").strip()
+        session_id = js.get("session_id") or session_id
 
-# Gunicorn/Render
+    if not session_id:
+        session_id = uuid.uuid4().hex
+
+    ses_dir = ensure_session_dir(session_id)
+
+    # 2) Guardar archivos si vienen en multipart
+    saved_files = []
+    if request.content_type and "multipart/form-data" in request.content_type.lower():
+        if "files" in request.files:
+            for f in request.files.getlist("files"):
+                if f and f.filename:
+                    try:
+                        dest = save_file(f, ses_dir)
+                        saved_files.append(dest.name)
+                    except ValueError as ve:
+                        return jsonify(error=str(ve)), 415
+
+    # 3) Cargar corpus de la sesión
+    docs = collect_session_texts(ses_dir)
+
+    # 4) Lógica de respuesta
+    if not message:
+        # Sin mensaje: devolver estado de sesión y ficheros
+        return jsonify(
+            session_id=session_id,
+            reply=(
+                "Sesión iniciada. Puedes escribir un mensaje o adjuntar un PDF.\n"
+                f"Archivos actuales: {', '.join([n for n, _ in docs]) if docs else '(ninguno)'}"
+            ),
+            used_files=saved_files,
+            mode="status"
+        )
+
+    # Si hay documentos, intentar respuesta extractiva
+    if docs:
+        hits = extractive_answer(docs, message, top_k=3)
+        if hits:
+            reply = (
+                "Esto es lo más relevante que he encontrado en tus documentos:\n\n"
+                f"{hits}\n\n"
+                "¿Quieres que lo resuma o que busque algo más específico?"
+            )
+            return jsonify(session_id=session_id, reply=reply, used_files=saved_files, mode="doc_search")
+
+        # No hubo coincidencias claras → responder con chat ligero + sugerencias
+        base = smalltalk_reply(message)
+        reply = (
+            f"{base}\n\n"
+            "No encontré coincidencias claras en los PDFs actuales. Si quieres, dime palabras clave más concretas "
+            "o adjunta el documento donde conste."
+        )
+        return jsonify(session_id=session_id, reply=reply, used_files=saved_files, mode="chat_fallback")
+
+    # No hay documentos → responder en modo “chat”
+    reply = smalltalk_reply(message)
+    return jsonify(session_id=session_id, reply=reply, used_files=saved_files, mode="chat")
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    # En Render usan gunicorn normalmente; esto es útil en local.
+    app.run(host="0.0.0.0", port=8000, debug=True)
